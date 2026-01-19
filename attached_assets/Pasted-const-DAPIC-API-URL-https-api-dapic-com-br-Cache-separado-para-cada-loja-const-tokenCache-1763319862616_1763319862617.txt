@@ -1,0 +1,164 @@
+const DAPIC_API_URL = 'https://api.dapic.com.br';
+
+// Cache separado para cada loja
+const tokenCache: Record<string, { token: string; expiresAt: number }> = {};
+
+async function getAccessToken(tokenIntegracao: string, lojaKey: string): Promise<string> {
+  // Verificar se temos um token em cache válido para esta loja
+  const now = Date.now();
+  if (tokenCache[lojaKey] && tokenCache[lojaKey].expiresAt > now) {
+    console.log(`Using cached access token for ${lojaKey}`);
+    return tokenCache[lojaKey].token;
+  }
+
+  console.log(`Requesting new access token from Dapic for ${lojaKey}`);
+  
+  const response = await fetch(`${DAPIC_API_URL}/autenticacao/v1/login`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({
+      Empresa: 'saron',
+      TokenIntegracao: tokenIntegracao,
+    }),
+  });
+
+  if (!response.ok) {
+    const errorText = await response.text();
+    console.error(`Authentication error for ${lojaKey}: ${response.status}`, errorText);
+    throw new Error(`Erro ao autenticar ${lojaKey} com Dapic: ${response.status}`);
+  }
+
+  const data = await response.json();
+  console.log(`Authentication successful for ${lojaKey}`);
+
+  // Armazenar em cache (expira em 23 horas para garantir)
+  const expiresIn = parseInt(data.expires_in) || 86400;
+  tokenCache[lojaKey] = {
+    token: data.access_token,
+    expiresAt: now + (expiresIn - 3600) * 1000, // 1 hora a menos para segurança
+  };
+
+  return data.access_token;
+}
+
+async function fetchVendasFromLoja(
+  accessToken: string, 
+  dataInicial: string, 
+  dataFinal: string,
+  lojaName: string
+): Promise<any[]> {
+  const queryParams = new URLSearchParams({
+    DataInicial: dataInicial,
+    DataFinal: dataFinal,
+    FiltrarPor: '0', // Data de fechamento
+    Status: '1', // Apenas vendas fechadas
+    RegistrosPorPagina: '1000',
+  });
+
+  const dapicUrl = `${DAPIC_API_URL}/v1/vendaspdv?${queryParams}`;
+  console.log(`Fetching from ${lojaName}: ${dapicUrl}`);
+
+  const response = await fetch(dapicUrl, {
+    method: 'GET',
+    headers: {
+      'Authorization': `Bearer ${accessToken}`,
+      'Accept': 'application/json',
+      'Content-Type': 'application/json',
+    },
+  });
+
+  if (!response.ok) {
+    const errorText = await response.text();
+    console.error(`Dapic API error for ${lojaName}: ${response.status}`, errorText);
+    throw new Error(`Erro na API Dapic (${lojaName}): ${response.status}`);
+  }
+
+  const data = await response.json();
+  console.log(`Data received from ${lojaName}: ${data.Dados?.length || 0} vendas`);
+
+  return data.Dados || [];
+}
+
+async function fetchContasPagarFromLoja(
+  accessToken: string, 
+  dataInicial: string, 
+  dataFinal: string,
+  lojaName: string
+): Promise<any[]> {
+  const queryParams = new URLSearchParams({
+    DataInicial: dataInicial,
+    DataFinal: dataFinal,
+    RegistrosPorPagina: '1000',
+  });
+
+  const dapicUrl = `${DAPIC_API_URL}/v1/contaspagar?${queryParams}`;
+  console.log(`Fetching contas a pagar from ${lojaName}: ${dapicUrl}`);
+
+  const response = await fetch(dapicUrl, {
+    method: 'GET',
+    headers: {
+      'Authorization': `Bearer ${accessToken}`,
+      'Accept': 'application/json',
+      'Content-Type': 'application/json',
+    },
+  });
+
+  if (!response.ok) {
+    const errorText = await response.text();
+    console.error(`Dapic API error for ${lojaName} contas a pagar: ${response.status}`, errorText);
+    throw new Error(`Erro na API Dapic contas a pagar (${lojaName}): ${response.status}`);
+  }
+
+  const data = await response.json();
+  console.log(`Contas a pagar received from ${lojaName}: ${data.Dados?.length || 0} contas`);
+
+  return data.Dados || [];
+}
+
+serve(async (req) => {
+  // Handle CORS preflight requests
+  if (req.method === 'OPTIONS') {
+    return new Response(null, { headers: corsHeaders });
+  }
+
+  try {
+    const DAPIC_TOKEN_SARON1 = Deno.env.get('DAPIC_API_KEY');
+    const DAPIC_TOKEN_SARON2 = Deno.env.get('DAPIC_API_KEY_SARON2');
+    
+    if (!DAPIC_TOKEN_SARON1) {
+      console.error('DAPIC_API_KEY not configured');
+      throw new Error('Token de integração do Dapic (Saron 1) não configurado');
+    }
+
+    const { action, params = {} } = await req.json();
+    
+    if (!action) {
+      throw new Error('Ação não especificada');
+    }
+
+    console.log(`Action: ${action}`, params);
+
+    // Buscar vendas do período atual
+    if (action === 'getVendas') {
+      const dataInicial = params.dataInicial || new Date(new Date().getFullYear(), new Date().getMonth(), 1).toISOString().split('T')[0];
+      const dataFinal = params.dataFinal || new Date().toISOString().split('T')[0];
+      
+      const todasVendas: any[] = [];
+
+      // Buscar vendas da Confecções Saron 1
+      try {
+        const accessTokenSaron1 = await getAccessToken(DAPIC_TOKEN_SARON1, 'Saron1');
+        const vendasSaron1 = await fetchVendasFromLoja(accessTokenSaron1, dataInicial, dataFinal, 'Confecções Saron 1');
+        // Garantir que todas as vendas tenham o campo Empresa
+        const vendasComEmpresa1 = vendasSaron1.map(venda => ({
+          ...venda,
+          Empresa: venda.Empresa || 'Confecções Saron 1'
+        }));
+        todasVendas.push(...vendasComEmpresa1);
+        console.log(`Vendas Saron 1: ${vendasComEmpresa1.length}`);
+      } catch (error) {
+        console.error('Erro ao buscar vendas Saron 1:', error);
+        // Continua mesmo com erro, para não bloquear Saron 2
+      }
